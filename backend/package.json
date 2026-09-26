@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "install-browsers": "playwright install chromium",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "scrape:headed": "node run-headed.js"
   },
   "dependencies": {
     "express": "^4.19.2",

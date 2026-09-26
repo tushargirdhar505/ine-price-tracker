@@ -1,0 +1,11 @@
+{
+  "name": "ine-price-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "INE Product Price & Stock Tracker — Web Scraping Intern Assignment",
+  "scripts": {
+    "start:backend": "npm --prefix backend run dev",
+    "start:frontend": "npm --prefix frontend run dev",
+    "scrape:headed": "npm --prefix backend run scrape:headed"
+  }
+}
