@@ -1,0 +1,17 @@
+{
+  "name": "ine-price-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone Playwright scraper for INE demo store price/stock (Step 2 of build plan)",
+  "type": "module",
+  "scripts": {
+    "install-browsers": "playwright install chromium",
+    "scrape": "node scrape.js",
+    "scrape:headed": "HEADLESS=false node scrape.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5"
+  }
+}
