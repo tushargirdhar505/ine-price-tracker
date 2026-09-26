@@ -235,7 +235,10 @@ async function attemptScrape(page, url, optionLabel) {
  * outcome for non-final failures.
  */
 export async function scrapeProductWithRetries(productPath, optionLabel) {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: process.env.HEADLESS !== 'false',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
   const page = await (await browser.newContext()).newPage();
   const url = `${STORE_BASE_URL}${productPath}`;
 
