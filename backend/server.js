@@ -148,46 +148,52 @@ app.post('/api/scrape-all', async (req, res) => {
 
   try {
     const products = await getTrackedProducts();
-    const summary = [];
 
-    for (const product of products) {
-      const attempts = await scrapeProductWithRetries(
-        `/item/${product.store_product_id}`,
-        product.option_label
-      );
-      let rowsStored = 0;
-      let dbWriteFailed = false;
+    // Respond immediately with 200 OK so cron-job.org never times out
+    res.status(200).json({
+      status: 'started',
+      message: `Scrape started for ${products.length} tracked products`,
+      productCount: products.length,
+      startedAt: new Date().toISOString(),
+    });
 
-      for (const attempt of attempts) {
+    // Run the scrape in background
+    (async () => {
+      console.log(`[scrape-all] Starting unattended scrape for ${products.length} products...`);
+      for (const product of products) {
         try {
-          await insertScrapeHistory({
-            productId: product.id,
-            timestamp: attempt.timestamp,
-            price: attempt.price,
-            stock: attempt.stock,
-            outcome: attempt.outcome,
-            detail: attempt.detail,
-          });
-          rowsStored++;
-        } catch (dbErr) {
-          console.error(`[scrape-all] Failed to store scrape_history row for product ${product.id}:`, dbErr.message);
-          dbWriteFailed = true;
+          console.log(`[scrape-all] Scraping product ${product.store_product_id} (${product.option_label})...`);
+          const attempts = await scrapeProductWithRetries(
+            `/item/${product.store_product_id}`,
+            product.option_label
+          );
+
+          for (const attempt of attempts) {
+            try {
+              await insertScrapeHistory({
+                productId: product.id,
+                timestamp: attempt.timestamp,
+                price: attempt.price,
+                stock: attempt.stock,
+                outcome: attempt.outcome,
+                detail: attempt.detail,
+              });
+            } catch (dbErr) {
+              console.error(`[scrape-all] Failed to store scrape_history row for product ${product.id}:`, dbErr.message);
+            }
+          }
+        } catch (productErr) {
+          console.error(`[scrape-all] Error scraping product ${product.id}:`, productErr.message);
         }
       }
-
-      summary.push({
-        productId: product.id,
-        productName: product.product_name,
-        finalOutcome: attempts[attempts.length - 1].outcome,
-        attemptsLogged: attempts.length,
-        rowsStored,
-        dbWriteFailed,
-      });
-    }
-
-    res.json({ scraped: summary.length, summary });
+      console.log(`[scrape-all] Finished background scrape run.`);
+    })().catch((err) => {
+      console.error(`[scrape-all] Fatal background error:`, err.message);
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
