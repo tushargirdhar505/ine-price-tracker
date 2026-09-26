@@ -20,6 +20,8 @@ const SELECTORS = {
   cookieConsentModal: '.consent-scrim',
   cookieConsentDismissBtn: '.consent-scrim button',
   pricePanel: '.offer-panel',
+  optionPicker: '.opt-picker',
+  optionChip: '.opt-picker .opt-chip',
   priceSuccessState: '.offer-panel.offer-ready',
   // The site randomizes which HTML tag holds the real price (<output>,
   // <b>, etc). What stays constant is this inline style, so we match on
@@ -88,6 +90,32 @@ async function simulateGenuineMouseMovement(page) {
     await page.waitForTimeout(60);
   }
   await page.waitForTimeout(750); // hold over the panel past the 600ms threshold
+}
+
+/**
+ * The store initially chooses a random option when the product page opens.
+ * Select the option the user actually chose before unlocking and checking the
+ * price. The option ID is validated by the API before this scraper is called;
+ * the browser UI identifies each option chip by its visible label.
+ */
+async function selectProductOption(page, optionLabel) {
+  if (!optionLabel) throw new Error('No selected option was supplied for this product.');
+
+  const picker = page.locator(SELECTORS.optionPicker).first();
+  await picker.waitFor({ state: 'visible', timeout: 10000 });
+
+  const option = picker.getByRole('button', { name: optionLabel, exact: true });
+  await option.waitFor({ state: 'visible', timeout: 5000 });
+
+  if ((await option.getAttribute('aria-pressed')) !== 'true') {
+    await option.click({ timeout: 5000 });
+    await option.waitFor({ state: 'attached', timeout: 3000 });
+    await page.waitForTimeout(150);
+  }
+
+  if ((await option.getAttribute('aria-pressed')) !== 'true') {
+    throw new Error(`Could not confirm selected option: ${optionLabel}`);
+  }
 }
 
 async function wiggleOverPanel(page) {
@@ -168,13 +196,14 @@ async function waitForPriceResult(page) {
   return { outcome: 'failed', price: null, stock: null, detail: 'timed out waiting for success/error state' };
 }
 
-async function attemptScrape(page, url) {
+async function attemptScrape(page, url, optionLabel) {
   try {
     // page.goto() is now INSIDE the try/catch — a navigation failure
     // (DNS hiccup, timeout, store briefly down) is a legitimate failed
     // attempt to retry, not something that should crash the whole cycle.
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await dismissCookieConsentIfPresent(page);
+    await selectProductOption(page, optionLabel);
     await simulateGenuineMouseMovement(page);
     await clickCheckPrice(page);
     const result = await waitForPriceResult(page);
@@ -205,7 +234,7 @@ async function attemptScrape(page, url) {
  * scrape_history row per attempt — matching the data model's 'retried'
  * outcome for non-final failures.
  */
-export async function scrapeProductWithRetries(productPath) {
+export async function scrapeProductWithRetries(productPath, optionLabel) {
   const browser = await chromium.launch({ headless: true });
   const page = await (await browser.newContext()).newPage();
   const url = `${STORE_BASE_URL}${productPath}`;
@@ -214,7 +243,7 @@ export async function scrapeProductWithRetries(productPath) {
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const timestamp = new Date().toISOString();
-    const result = await attemptScrape(page, url);
+    const result = await attemptScrape(page, url, optionLabel);
     const isLastAttempt = attempt === MAX_ATTEMPTS;
     const rowOutcome = result.outcome === 'success' ? 'success' : isLastAttempt ? 'failed' : 'retried';
 

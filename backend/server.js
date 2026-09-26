@@ -33,6 +33,12 @@ app.use(express.json());
 const STORE_BASE_URL = 'https://demo.inelabteamdev.com';
 const PORT = process.env.PORT || 3000;
 
+async function getStoreProduct(storeProductId) {
+  const response = await fetch(`${STORE_BASE_URL}/api/v2/items/${encodeURIComponent(storeProductId)}`);
+  if (!response.ok) throw new Error(`Store product lookup failed with HTTP ${response.status}`);
+  return response.json();
+}
+
 // ---------------------------------------------------------------------
 // GET /api/search?query=xyz — proxies the store's own catalog endpoint,
 // then filters by name server-side (the store's endpoint only documents
@@ -69,15 +75,38 @@ app.get('/api/search', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
+// GET /api/catalog/:storeProductId — details and real selectable options for
+// the frontend after the user chooses a result from /api/search.
+app.get('/api/catalog/:storeProductId', async (req, res) => {
+  try {
+    res.json(await getStoreProduct(req.params.storeProductId));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // POST /api/track — body: { storeProductId, productName, optionId, optionLabel }
 // ---------------------------------------------------------------------
 app.post('/api/track', async (req, res) => {
   const { storeProductId, productName, optionId, optionLabel } = req.body;
-  if (!storeProductId || !productName) {
-    return res.status(400).json({ error: 'storeProductId and productName are required' });
+  if (!storeProductId || !productName || !optionId || !optionLabel) {
+    return res.status(400).json({ error: 'storeProductId, productName, optionId, and optionLabel are required' });
   }
   try {
-    const row = await insertTrackedProduct({ storeProductId, productName, optionId, optionLabel });
+    // Never trust a browser-submitted option blindly. Check it against the
+    // store's product data and persist the canonical name and option label.
+    const storeProduct = await getStoreProduct(storeProductId);
+    const storeOption = storeProduct.options?.find((option) => option.id === optionId);
+    if (!storeOption || storeOption.label !== optionLabel) {
+      return res.status(400).json({ error: 'The selected option does not belong to this store product' });
+    }
+
+    const row = await insertTrackedProduct({
+      storeProductId: storeProduct.id,
+      productName: storeProduct.name,
+      optionId: storeOption.id,
+      optionLabel: storeOption.label,
+    });
     res.status(201).json(row);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -122,7 +151,10 @@ app.post('/api/scrape-all', async (req, res) => {
     const summary = [];
 
     for (const product of products) {
-      const attempts = await scrapeProductWithRetries(`/item/${product.store_product_id}`);
+      const attempts = await scrapeProductWithRetries(
+        `/item/${product.store_product_id}`,
+        product.option_label
+      );
       let rowsStored = 0;
       let dbWriteFailed = false;
 
