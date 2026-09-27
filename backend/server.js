@@ -136,6 +136,62 @@ app.get('/api/products/:id/history', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
+// POST /api/products/:id/scrape — Scrapes a single tracked product
+// immediately in the background. No secret required — safe for users
+// to call from the dashboard (e.g. right after adding a new product,
+// or from a per-product "Check Price Now" button).
+// ---------------------------------------------------------------------
+app.post('/api/products/:id/scrape', async (req, res) => {
+  try {
+    const products = await getTrackedProducts();
+    const product = products.find((p) => p.id === req.params.id);
+    if (!product) {
+      return res.status(404).json({ error: 'Tracked product not found' });
+    }
+
+    // Respond immediately so the frontend never waits on Playwright
+    res.status(202).json({
+      status: 'started',
+      message: `Scrape started for "${product.product_name}" (${product.option_label})`,
+      productId: product.id,
+      startedAt: new Date().toISOString(),
+    });
+
+    // Scrape in the background
+    (async () => {
+      console.log(`[scrape-one] Scraping product ${product.store_product_id} (${product.option_label})...`);
+      try {
+        const attempts = await scrapeProductWithRetries(
+          `/item/${product.store_product_id}`,
+          product.option_label
+        );
+        for (const attempt of attempts) {
+          try {
+            await insertScrapeHistory({
+              productId: product.id,
+              timestamp: attempt.timestamp,
+              price: attempt.price,
+              stock: attempt.stock,
+              outcome: attempt.outcome,
+              detail: attempt.detail,
+            });
+          } catch (dbErr) {
+            console.error(`[scrape-one] DB write error for product ${product.id}:`, dbErr.message);
+          }
+        }
+        console.log(`[scrape-one] Done. Final outcome: ${attempts[attempts.length - 1].outcome}`);
+      } catch (err) {
+        console.error(`[scrape-one] Fatal error for product ${product.id}:`, err.message);
+      }
+    })();
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+// ---------------------------------------------------------------------
 // POST /api/scrape-all — secret-protected. Scrapes every tracked product,
 // writing one scrape_history row per attempt. This is what cron-job.org
 // calls every 2 hours.

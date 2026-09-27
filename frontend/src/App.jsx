@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -33,6 +33,11 @@ export default function App() {
   const [loadingProducts, setLoadingProducts] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
+  // Per-product scrape state: tracks which product is currently being scraped
+  const [scrapingProductId, setScrapingProductId] = useState(null);
+  // Polling: after a per-product scrape starts, poll for new history rows
+  const pollTimerRef = useRef(null);
+
   // Search & Catalog state
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -43,91 +48,83 @@ export default function App() {
   const [selectedOption, setSelectedOption] = useState(null);
   const [trackingProduct, setTrackingProduct] = useState(false);
 
-  // Action states
-  const [scrapingAll, setScrapingAll] = useState(false);
   const [alert, setAlert] = useState(null);
   const searchTimeoutRef = useRef(null);
 
-  // Notification helper
+  // Notification helper (auto-clears after 6s)
   const showAlert = (message, type = 'info') => {
     setAlert({ message, type });
-    setTimeout(() => setAlert(null), 5000);
+    setTimeout(() => setAlert(null), 6000);
   };
 
-  // 1. Fetch tracked products on mount
-  const fetchTrackedProducts = async () => {
+  // ── 1. Fetch tracked products ────────────────────────────────────────
+  const fetchTrackedProducts = useCallback(async ({ selectId } = {}) => {
     try {
       setLoadingProducts(true);
       const res = await fetch(`${API_BASE}/api/products`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setTrackedProducts(data);
-      if (data.length > 0 && !selectedProduct) {
-        setSelectedProduct(data[0]);
+
+      if (selectId) {
+        const target = data.find((p) => p.id === selectId);
+        if (target) setSelectedProduct(target);
+      } else {
+        setSelectedProduct((prev) => {
+          if (prev) return prev; // keep current selection
+          return data.length > 0 ? data[0] : null;
+        });
       }
     } catch (err) {
       showAlert(`Failed to fetch tracked products: ${err.message}`, 'danger');
     } finally {
       setLoadingProducts(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchTrackedProducts();
+  }, [fetchTrackedProducts]);
+
+  // ── 2. Fetch history whenever selected product changes ───────────────
+  const fetchHistory = useCallback(async (productId) => {
+    if (!productId) { setProductHistory([]); return; }
+    try {
+      setLoadingHistory(true);
+      const res = await fetch(`${API_BASE}/api/products/${productId}/history`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setProductHistory(await res.json());
+    } catch (err) {
+      showAlert(`Failed to fetch history: ${err.message}`, 'danger');
+    } finally {
+      setLoadingHistory(false);
+    }
   }, []);
 
-  // 2. Fetch history whenever selected product changes
   useEffect(() => {
-    if (!selectedProduct) {
-      setProductHistory([]);
-      return;
-    }
+    fetchHistory(selectedProduct?.id);
+  }, [selectedProduct, fetchHistory]);
 
-    const fetchHistory = async () => {
-      try {
-        setLoadingHistory(true);
-        const res = await fetch(`${API_BASE}/api/products/${selectedProduct.id}/history`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        setProductHistory(data);
-      } catch (err) {
-        showAlert(`Failed to fetch history for ${selectedProduct.product_name}: ${err.message}`, 'danger');
-      } finally {
-        setLoadingHistory(false);
-      }
-    };
-
-    fetchHistory();
-  }, [selectedProduct]);
-
-  // 3. Search debouncer
+  // ── 3. Search debouncer ──────────────────────────────────────────────
   useEffect(() => {
     if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-
-    if (!searchQuery.trim()) {
-      setSearchResults([]);
-      setSearching(false);
-      return;
-    }
-
+    if (!searchQuery.trim()) { setSearchResults([]); setSearching(false); return; }
     setSearching(true);
     searchTimeoutRef.current = setTimeout(async () => {
       try {
         const res = await fetch(`${API_BASE}/api/search?query=${encodeURIComponent(searchQuery.trim())}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        setSearchResults(data);
+        setSearchResults(await res.json());
       } catch (err) {
         showAlert(`Search failed: ${err.message}`, 'danger');
       } finally {
         setSearching(false);
       }
     }, 350);
-
     return () => clearTimeout(searchTimeoutRef.current);
   }, [searchQuery]);
 
-  // 4. Select an item from search results to load options
+  // ── 4. Select a catalog search result to load its options ────────────
   const handleSelectSearchItem = async (item) => {
     setSelectedCatalogItem(item);
     setSelectedOption(null);
@@ -137,9 +134,7 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const details = await res.json();
       setCatalogDetails(details);
-      if (details.options && details.options.length > 0) {
-        setSelectedOption(details.options[0]);
-      }
+      if (details.options?.length > 0) setSelectedOption(details.options[0]);
     } catch (err) {
       showAlert(`Failed to load options: ${err.message}`, 'danger');
     } finally {
@@ -147,10 +142,64 @@ export default function App() {
     }
   };
 
-  // 5. Track chosen product + option
+  // ── 5. Trigger a single-product scrape (no secret needed) ────────────
+  //    Called: (a) right after tracking a new product,
+  //            (b) when user clicks "Check Price Now" on any product card.
+  const triggerSingleScrape = useCallback(async (productId, productName) => {
+    if (scrapingProductId) return; // prevent double-trigger
+    setScrapingProductId(productId);
+    showAlert(`Checking current price for "${productName}"... This takes ~20–40s. The page will auto-refresh.`, 'info');
+
+    try {
+      const res = await fetch(`${API_BASE}/api/products/${productId}/scrape`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+
+      // Poll every 10s for up to 90s to detect when new history row appears
+      let polls = 0;
+      const maxPolls = 9;
+      const previousCount = productHistory.length;
+
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = setInterval(async () => {
+        polls++;
+        try {
+          const hRes = await fetch(`${API_BASE}/api/products/${productId}/history`);
+          if (hRes.ok) {
+            const newHistory = await hRes.json();
+            if (newHistory.length > previousCount || polls >= maxPolls) {
+              clearInterval(pollTimerRef.current);
+              setScrapingProductId(null);
+              if (selectedProduct?.id === productId) {
+                setProductHistory(newHistory);
+              }
+              if (newHistory.length > previousCount) {
+                const latest = newHistory[0];
+                if (latest.outcome === 'success') {
+                  showAlert(`✅ Price updated! ${productName}: ${formatCurrency(latest.price)}, Stock: ${latest.stock}`, 'info');
+                } else {
+                  showAlert(`⚠️ Scrape completed (outcome: ${latest.outcome}). Will retry on next scheduled run.`, 'info');
+                }
+              }
+            }
+          }
+        } catch { /* swallow polling errors */ }
+        if (polls >= maxPolls) {
+          clearInterval(pollTimerRef.current);
+          setScrapingProductId(null);
+        }
+      }, 10000);
+    } catch (err) {
+      showAlert(`Failed to start scrape: ${err.message}`, 'danger');
+      setScrapingProductId(null);
+    }
+  }, [scrapingProductId, productHistory.length, selectedProduct]);
+
+  // ── 6. Track a product then immediately scrape it ────────────────────
   const handleTrackProduct = async () => {
     if (!selectedCatalogItem || !selectedOption) return;
-
     setTrackingProduct(true);
     try {
       const res = await fetch(`${API_BASE}/api/track`, {
@@ -170,18 +219,19 @@ export default function App() {
       }
 
       const newProduct = await res.json();
-      showAlert(`Successfully tracking "${newProduct.product_name}" (${newProduct.option_label})!`, 'info');
-      
-      // Reset search drawer and refresh
+
+      // Reset search UI
       setSearchQuery('');
       setSearchResults([]);
       setSelectedCatalogItem(null);
       setCatalogDetails(null);
       setSelectedOption(null);
 
-      // Refresh products list and select the new product
-      await fetchTrackedProducts();
-      setSelectedProduct(newProduct);
+      // Refresh list and select the new product
+      await fetchTrackedProducts({ selectId: newProduct.id });
+
+      // FIX 1: Auto-scrape immediately so price shows right away
+      triggerSingleScrape(newProduct.id, newProduct.product_name);
     } catch (err) {
       showAlert(`Could not track product: ${err.message}`, 'danger');
     } finally {
@@ -189,53 +239,16 @@ export default function App() {
     }
   };
 
-  // 6. Manual Scrape All trigger (useful for testing & evaluation)
-  const handleManualScrape = async () => {
-    const secret = window.prompt("Enter your SCRAPE_SECRET to trigger an immediate scrape run:");
-    if (!secret) return;
-
-    setScrapingAll(true);
-    showAlert("Triggering scrape across all tracked products... This may take ~30-60s.", "info");
-
-    try {
-      const res = await fetch(`${API_BASE}/api/scrape-all`, {
-        method: 'POST',
-        headers: {
-          'x-scrape-secret': secret,
-        },
-      });
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || `HTTP ${res.status}`);
-      }
-
-      const result = await res.json();
-      showAlert(`Scrape completed! Scraped ${result.scraped} products.`, "info");
-      
-      // Refresh current product's history
-      if (selectedProduct) {
-        const historyRes = await fetch(`${API_BASE}/api/products/${selectedProduct.id}/history`);
-        if (historyRes.ok) {
-          setProductHistory(await historyRes.json());
-        }
-      }
-    } catch (err) {
-      showAlert(`Scrape run failed: ${err.message}`, "danger");
-    } finally {
-      setScrapingAll(false);
-    }
-  };
-
-  // Derive latest valid scrape from history
+  // ── Derived data ─────────────────────────────────────────────────────
   const latestScrape = productHistory.length > 0 ? productHistory[0] : null;
   const latestSuccess = productHistory.find((h) => h.outcome === 'success');
 
-  // Chart data: successful points ordered from oldest to newest
+  // FIX 3: Chart must only use rows with a real price (successful rows), oldest → newest
   const chartPoints = [...productHistory]
-    .filter((h) => h.price !== null)
-    .reverse();
+    .filter((h) => h.outcome === 'success' && h.price !== null && h.price !== undefined)
+    .reverse(); // DB returns newest first, chart needs oldest first
 
+  // ─────────────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
       {/* Header */}
@@ -243,24 +256,17 @@ export default function App() {
         <div className="brand-section">
           <div className="brand-icon">⚡</div>
           <div>
-            <h1 className="brand-title">INE Price & Stock Tracker</h1>
+            <h1 className="brand-title">INE Price &amp; Stock Tracker</h1>
             <p className="brand-subtitle">Automated unattended scraping monitor for INE Mock Store</p>
           </div>
         </div>
 
         <div className="header-actions">
-          <button 
-            className="btn btn-outline" 
-            onClick={handleManualScrape}
-            disabled={scrapingAll || trackedProducts.length === 0}
-          >
-            {scrapingAll ? <span className="spinner"></span> : '▶'}
-            <span>{scrapingAll ? 'Scraping...' : 'Trigger Scrape Now'}</span>
-          </button>
-
-          <a 
-            className="btn btn-primary" 
-            href={`${API_BASE}/api/export.csv`} 
+          {/* FIX 2: Removed secret-prompt "Trigger Scrape Now" button.
+              Per-product "Check Price Now" buttons are on each product card instead. */}
+          <a
+            className="btn btn-primary"
+            href={`${API_BASE}/api/export.csv`}
             download="scrape_history.csv"
             target="_blank"
             rel="noreferrer"
@@ -283,10 +289,11 @@ export default function App() {
       <div className="dashboard-grid">
         {/* Left Column: Search & Tracked List */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+
           {/* Card: Search & Track */}
           <div className="card">
             <div className="card-header">
-              <h2 className="card-title">🔍 Find & Track Product</h2>
+              <h2 className="card-title">🔍 Find &amp; Track Product</h2>
             </div>
 
             <div className="search-wrapper">
@@ -300,7 +307,6 @@ export default function App() {
               />
             </div>
 
-            {/* Live Search Results */}
             {searching && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
                 <span className="spinner"></span>
@@ -326,7 +332,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Option Picker for Selected Search Item */}
             {selectedCatalogItem && (
               <div className="options-panel">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -334,7 +339,7 @@ export default function App() {
                   {loadingCatalog && <span className="spinner"></span>}
                 </div>
 
-                {catalogDetails?.options && catalogDetails.options.length > 0 ? (
+                {catalogDetails?.options?.length > 0 ? (
                   <div className="options-grid">
                     {catalogDetails.options.map((opt) => (
                       <button
@@ -359,7 +364,7 @@ export default function App() {
                   disabled={!selectedOption || trackingProduct}
                 >
                   {trackingProduct ? <span className="spinner"></span> : '+'}
-                  <span>{trackingProduct ? 'Adding to Tracker...' : `Track "${selectedOption?.label || ''}"`}</span>
+                  <span>{trackingProduct ? 'Adding & Checking Price...' : `Track "${selectedOption?.label || ''}"`}</span>
                 </button>
               </div>
             )}
@@ -372,10 +377,10 @@ export default function App() {
                 📦 Tracked Products
                 <span className="badge badge-neutral">{trackedProducts.length}</span>
               </h2>
-              <button 
-                className="btn btn-outline" 
-                style={{ padding: '4px 8px', fontSize: '0.75rem' }} 
-                onClick={fetchTrackedProducts}
+              <button
+                className="btn btn-outline"
+                style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                onClick={() => fetchTrackedProducts()}
               >
                 🔄 Refresh
               </button>
@@ -395,6 +400,7 @@ export default function App() {
               <div className="product-list">
                 {trackedProducts.map((p) => {
                   const isActive = selectedProduct?.id === p.id;
+                  const isScraping = scrapingProductId === p.id;
                   return (
                     <div
                       key={p.id}
@@ -410,6 +416,24 @@ export default function App() {
                         <span>•</span>
                         <span>Tracked on {new Date(p.created_at).toLocaleDateString()}</span>
                       </div>
+                      {/* FIX 2: Per-product Check Price Now button — no secret needed */}
+                      <button
+                        type="button"
+                        className="btn btn-outline"
+                        style={{ width: '100%', justifyContent: 'center', marginTop: '6px', fontSize: '0.78rem', padding: '5px 10px' }}
+                        disabled={isScraping || scrapingProductId !== null}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedProduct(p);
+                          triggerSingleScrape(p.id, p.product_name);
+                        }}
+                      >
+                        {isScraping ? (
+                          <><span className="spinner"></span><span>Checking price...</span></>
+                        ) : (
+                          <><span>🔄</span><span>Check Price Now</span></>
+                        )}
+                      </button>
                     </div>
                   );
                 })}
@@ -418,7 +442,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right Column: Selected Product History & Scrape Logs */}
+        {/* Right Column: Selected Product Detail */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
           {selectedProduct ? (
             <>
@@ -432,11 +456,18 @@ export default function App() {
                     </p>
                   </div>
 
-                  {latestScrape && (
-                    <span className={`badge badge-${latestScrape.outcome === 'success' ? 'success' : latestScrape.outcome === 'retried' ? 'warning' : 'danger'}`}>
-                      Latest: {latestScrape.outcome}
-                    </span>
-                  )}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    {latestScrape && (
+                      <span className={`badge badge-${latestScrape.outcome === 'success' ? 'success' : latestScrape.outcome === 'retried' ? 'warning' : 'danger'}`}>
+                        Latest: {latestScrape.outcome}
+                      </span>
+                    )}
+                    {scrapingProductId === selectedProduct.id && (
+                      <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                        <span className="spinner"></span> Scraping...
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* Stat Highlights */}
@@ -444,22 +475,26 @@ export default function App() {
                   <div style={{ background: 'var(--bg-card)', padding: '12px 16px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Current Price</div>
                     <div className="price-display">
-                      {latestSuccess ? formatCurrency(latestSuccess.price) : 'Pending first run'}
+                      {scrapingProductId === selectedProduct.id
+                        ? <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Checking...</span>
+                        : latestSuccess
+                          ? formatCurrency(latestSuccess.price)
+                          : <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>No data yet</span>
+                      }
                     </div>
                   </div>
 
                   <div style={{ background: 'var(--bg-card)', padding: '12px 16px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Current Stock</div>
                     <div style={{ fontSize: '1.15rem', fontWeight: '700', marginTop: '2px' }}>
-                      {latestSuccess ? (
-                        latestSuccess.stock === 0 ? (
-                          <span style={{ color: 'var(--danger)' }}>Sold Out (0)</span>
-                        ) : (
-                          <span style={{ color: 'var(--success)' }}>{latestSuccess.stock} units available</span>
-                        )
-                      ) : (
-                        '—'
-                      )}
+                      {scrapingProductId === selectedProduct.id
+                        ? <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Checking...</span>
+                        : latestSuccess
+                          ? (latestSuccess.stock === 0
+                              ? <span style={{ color: 'var(--danger)' }}>Sold Out</span>
+                              : <span style={{ color: 'var(--success)' }}>{latestSuccess.stock} units available</span>)
+                          : '—'
+                      }
                     </div>
                   </div>
 
@@ -472,17 +507,22 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Price Trend Chart Card */}
+              {/* Price Trend Chart */}
               <div className="card">
                 <div className="card-header">
                   <h3 className="card-title">📈 Price History Trend</h3>
-                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Over unattended scrape runs</span>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    {chartPoints.length} successful data point{chartPoints.length !== 1 ? 's' : ''}
+                  </span>
                 </div>
 
                 {chartPoints.length < 2 ? (
                   <div className="empty-state" style={{ height: '180px' }}>
-                    <span>Not enough price points to draw chart yet.</span>
-                    <span style={{ fontSize: '0.78rem' }}>Run a scrape or wait for scheduled runs to populate points.</span>
+                    <span>
+                      {chartPoints.length === 1
+                        ? '1 data point — need at least 2 to draw a trend line. More points will appear after scheduled runs.'
+                        : 'No price data yet. Click "Check Price Now" or wait for the 2-hour scheduled run.'}
+                    </span>
                   </div>
                 ) : (
                   <div className="chart-container">
@@ -491,21 +531,33 @@ export default function App() {
                 )}
               </div>
 
-              {/* Per-Product Scrape Log Card (PDF Requirement: Failures must be recorded honestly) */}
+              {/* Scrape Audit Log */}
               <div className="card">
                 <div className="card-header">
                   <div>
                     <h3 className="card-title">📜 Audit Scrape Log</h3>
                     <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                      Every scrape attempt is recorded honestly (including retries and upstream errors)
+                      Every attempt recorded honestly — retries, upstream errors, and successes
                     </p>
                   </div>
-                  {loadingHistory && <span className="spinner"></span>}
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    {loadingHistory && <span className="spinner"></span>}
+                    <button
+                      className="btn btn-outline"
+                      style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                      onClick={() => fetchHistory(selectedProduct?.id)}
+                    >
+                      🔄
+                    </button>
+                  </div>
                 </div>
 
                 {productHistory.length === 0 ? (
                   <div className="empty-state">
-                    <span>No scrape logs recorded for this product yet.</span>
+                    {scrapingProductId === selectedProduct.id
+                      ? <><span className="spinner"></span><span>Scrape in progress, logs will appear shortly...</span></>
+                      : <span>No scrape logs yet. Click "Check Price Now" above to trigger the first scrape.</span>
+                    }
                   </div>
                 ) : (
                   <div className="table-wrapper">
@@ -516,7 +568,7 @@ export default function App() {
                           <th>Outcome</th>
                           <th>Price</th>
                           <th>Stock</th>
-                          <th>Attempt Detail / Error Message</th>
+                          <th>Detail / Error Message</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -532,19 +584,15 @@ export default function App() {
                               {row.price !== null ? formatCurrency(row.price) : '—'}
                             </td>
                             <td>
-                              {row.stock !== null ? (
-                                row.stock === 0 ? (
-                                  <span className="badge badge-danger">Sold Out (0)</span>
-                                ) : (
-                                  <span className="pill-stock">{row.stock} in stock</span>
-                                )
-                              ) : (
-                                '—'
-                              )}
+                              {row.stock !== null
+                                ? row.stock === 0
+                                  ? <span className="badge badge-danger">Sold Out (0)</span>
+                                  : <span className="pill-stock">{row.stock} in stock</span>
+                                : '—'}
                             </td>
                             <td>
-                              <span className="detail-text" title={row.detail || 'Completed'}>
-                                {row.detail || (row.outcome === 'success' ? 'Price and stock verified' : '—')}
+                              <span className="detail-text" title={row.detail || ''}>
+                                {row.detail || (row.outcome === 'success' ? 'Price and stock verified ✓' : '—')}
                               </span>
                             </td>
                           </tr>
@@ -567,76 +615,85 @@ export default function App() {
   );
 }
 
-// Lightweight, dependency-free interactive SVG Line Chart
+// ── Dependency-free SVG Line Chart ────────────────────────────────────
+// FIX 3: Only receives pre-filtered success rows (price is always a real number)
 function SimpleLineChart({ data }) {
   if (!data || data.length < 2) return null;
 
   const width = 760;
   const height = 180;
-  const padding = { top: 20, right: 30, bottom: 30, left: 60 };
+  const padding = { top: 20, right: 30, bottom: 40, left: 70 };
 
   const prices = data.map((d) => d.price);
-  const minPrice = Math.min(...prices) * 0.95;
-  const maxPrice = Math.max(...prices) * 1.05;
-  const priceRange = maxPrice - minPrice || 1;
+  const rawMin = Math.min(...prices);
+  const rawMax = Math.max(...prices);
 
-  const getX = (index) => {
-    return padding.left + (index / (data.length - 1)) * (width - padding.left - padding.right);
-  };
+  // If all prices are identical, add a 5% buffer so the line is centered
+  const spread = rawMax - rawMin;
+  const minPrice = spread === 0 ? rawMin * 0.95 : rawMin * 0.97;
+  const maxPrice = spread === 0 ? rawMax * 1.05 : rawMax * 1.03;
+  const priceRange = maxPrice - minPrice;
 
-  const getY = (price) => {
-    return height - padding.bottom - ((price - minPrice) / priceRange) * (height - padding.top - padding.bottom);
-  };
+  const getX = (index) =>
+    padding.left + (index / (data.length - 1)) * (width - padding.left - padding.right);
+
+  const getY = (price) =>
+    height - padding.bottom - ((price - minPrice) / priceRange) * (height - padding.top - padding.bottom);
 
   const points = data.map((d, i) => `${getX(i)},${getY(d.price)}`).join(' ');
+
+  const formatCurrencyShort = (n) => {
+    if (n >= 100000) return `₹${(n / 100000).toFixed(1)}L`;
+    if (n >= 1000) return `₹${(n / 1000).toFixed(1)}K`;
+    return `₹${Math.round(n)}`;
+  };
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} className="chart-svg">
       <defs>
         <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.3" />
+          <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.25" />
           <stop offset="100%" stopColor="#3b82f6" stopOpacity="0.0" />
         </linearGradient>
       </defs>
 
-      {/* Grid Lines */}
-      <line x1={padding.left} y1={padding.top} x2={width - padding.right} y2={padding.top} stroke="#334155" strokeDasharray="3 3" />
-      <line x1={padding.left} y1={height / 2} x2={width - padding.right} y2={height / 2} stroke="#334155" strokeDasharray="3 3" />
-      <line x1={padding.left} y1={height - padding.bottom} x2={width - padding.right} y2={height - padding.bottom} stroke="#334155" />
+      {/* Grid lines */}
+      {[0, 0.5, 1].map((frac) => {
+        const y = padding.top + frac * (height - padding.top - padding.bottom);
+        const price = maxPrice - frac * priceRange;
+        return (
+          <g key={frac}>
+            <line x1={padding.left} y1={y} x2={width - padding.right} y2={y} stroke="#334155" strokeDasharray="3 3" strokeWidth="0.8" />
+            <text x={padding.left - 6} y={y + 4} fill="#94a3b8" fontSize="10" textAnchor="end">
+              {formatCurrencyShort(price)}
+            </text>
+          </g>
+        );
+      })}
 
-      {/* Y Axis labels */}
-      <text x={padding.left - 10} y={padding.top + 4} fill="#94a3b8" fontSize="10" textAnchor="end">
-        {formatCurrency(Math.round(maxPrice))}
-      </text>
-      <text x={padding.left - 10} y={height - padding.bottom} fill="#94a3b8" fontSize="10" textAnchor="end">
-        {formatCurrency(Math.round(minPrice))}
-      </text>
+      {/* X-axis labels: first, middle, last */}
+      {[0, Math.floor((data.length - 1) / 2), data.length - 1]
+        .filter((v, i, a) => a.indexOf(v) === i)
+        .map((i) => (
+          <text key={i} x={getX(i)} y={height - 4} fill="#94a3b8" fontSize="9" textAnchor="middle">
+            {new Date(data[i].timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true })}
+          </text>
+        ))}
 
-      {/* Fill Area */}
+      {/* Fill area */}
       <polygon
-        points={`${padding.left},${height - padding.bottom} ${points} ${width - padding.right},${height - padding.bottom}`}
+        points={`${getX(0)},${height - padding.bottom} ${points} ${getX(data.length - 1)},${height - padding.bottom}`}
         fill="url(#chartGradient)"
       />
 
-      {/* Trend Line */}
-      <polyline
-        fill="none"
-        stroke="#3b82f6"
-        strokeWidth="2.5"
-        points={points}
-      />
+      {/* Trend line */}
+      <polyline fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeLinejoin="round" points={points} />
 
-      {/* Data Points */}
+      {/* Data points with price tooltip on hover */}
       {data.map((d, i) => (
         <g key={i}>
-          <circle
-            cx={getX(i)}
-            cy={getY(d.price)}
-            r="4"
-            fill="#1e293b"
-            stroke="#3b82f6"
-            strokeWidth="2"
-          />
+          <circle cx={getX(i)} cy={getY(d.price)} r="5" fill="#0f172a" stroke="#3b82f6" strokeWidth="2" />
+          <title>{`₹${d.price.toLocaleString('en-IN')} — ${new Date(d.timestamp).toLocaleString()}`}</title>
         </g>
       ))}
     </svg>
